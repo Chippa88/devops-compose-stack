@@ -1,0 +1,276 @@
+# ============================================================
+# DOCKER COMPOSE STACK — DevOps Home Lab Project #5
+# Author: Chip Sineath
+# ============================================================
+# WHAT IS DOCKER COMPOSE?
+#   Real applications don't run as a single container. They're made
+#   of multiple services talking to each other:
+#     - A web server (nginx) that handles HTTP requests
+#     - An app server (Node.js or Python) that runs business logic
+#     - A database (PostgreSQL) that stores data
+#     - A cache (Redis) that speeds up repeated queries
+#
+#   Docker Compose lets you define ALL of these services in one YAML
+#   file and start them all with ONE command: docker compose up
+#
+#   Each service runs in its own container but they can communicate
+#   with each other over a private internal network.
+#
+# HOW TO RUN:
+#   docker compose up -d           # Start all services in background
+#   docker compose ps              # See running services
+#   docker compose logs -f         # Follow all logs
+#   docker compose down            # Stop and remove containers
+#   docker compose down -v         # Also delete data volumes
+# ============================================================
+
+# 'version' specifies which Docker Compose format to use
+# 3.9 is current and widely supported
+version: '3.9'
+
+# 'services' defines each container in our stack
+services:
+
+  # ── SERVICE 1: NGINX (Reverse Proxy + Static Files) ────
+  # A reverse proxy sits in front of your app and forwards requests to it.
+  # Benefits: SSL termination, load balancing, rate limiting, caching.
+  # In production, nginx is ALWAYS the first thing traffic hits.
+  nginx:
+    # image: pull this from Docker Hub (hub.docker.com)
+    # nginx:1.25-alpine: nginx version 1.25, alpine = tiny linux base
+    image: nginx:1.25-alpine
+    
+    # container_name: give it a fixed name (otherwise Docker generates a random one)
+    container_name: homelab_nginx
+    
+    # ports: map HOST:CONTAINER
+    # "8080:80" means: if you visit localhost:8080, nginx (inside the container)
+    # receives it on port 80. The container doesn't know about 8080.
+    ports:
+      - "8080:80"
+    
+    # volumes: mount files/directories from your host INTO the container
+    # This is how config changes take effect without rebuilding the image
+    # ./nginx/nginx.conf: a file on YOUR computer
+    # /etc/nginx/conf.d/default.conf: where nginx looks for config inside the container
+    # :ro means "read-only" — the container can read but not modify this file
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./app/static:/usr/share/nginx/html:ro
+    
+    # depends_on: don't start nginx until these services are running
+    # This ensures the app is up before nginx tries to proxy traffic to it
+    depends_on:
+      app:
+        condition: service_healthy   # Wait for the HEALTHCHECK to pass, not just start
+    
+    # networks: which internal networks this service joins
+    # Services on the same network can reach each other by service name
+    networks:
+      - frontend
+    
+    # restart: what to do if the container crashes
+    # unless-stopped: always restart UNLESS we manually stopped it
+    restart: unless-stopped
+
+  # ── SERVICE 2: APP SERVER (Node.js) ────────────────────
+  app:
+    # build: instead of using a pre-built image, build from a Dockerfile
+    # context: . means use the current directory as the build context
+    # dockerfile: the name of the Dockerfile to use
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    
+    container_name: homelab_app
+    
+    # expose: make this port available to OTHER containers on the same network
+    # (but NOT accessible from outside Docker — no host port mapping)
+    # Only nginx should talk to the app directly
+    expose:
+      - "3000"
+    
+    # environment: set environment variables inside the container
+    # This is how you configure apps without hardcoding values
+    # Variables reference other services by their service NAME (not IP addresses)
+    # Docker's internal DNS resolves service names to container IPs automatically
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DB_HOST=postgres          # 'postgres' = the service name below, not an IP
+      - DB_PORT=5432
+      - DB_NAME=homelab_db
+      - DB_USER=homelab_user
+      - DB_PASSWORD=homelab_pass  # In production, use Docker secrets instead of plaintext
+      - REDIS_HOST=redis           # 'redis' = service name
+      - REDIS_PORT=6379
+    
+    # healthcheck: Docker runs this command periodically to check app health
+    # If it fails 3 times in a row, the container is marked "unhealthy"
+    # and nginx will stop routing traffic to it
+    healthcheck:
+      # wget: makes an HTTP request to the app's health endpoint
+      # --quiet: don't print response body
+      # -O -: write response to stdout (discards it)
+      # || exit 1: if wget fails, return exit code 1 (failure)
+      test: ["CMD", "wget", "--quiet", "-O", "-", "http://localhost:3000/health", "||", "exit", "1"]
+      interval: 30s      # Check every 30 seconds
+      timeout: 10s       # Give it 10 seconds to respond
+      retries: 3         # Mark unhealthy after 3 failures
+      start_period: 40s  # Don't start checking until 40s after container starts
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started   # Redis is usually fast, just wait for it to start
+    
+    networks:
+      - frontend   # Can talk to nginx
+      - backend    # Can talk to postgres and redis
+    
+    restart: unless-stopped
+
+  # ── SERVICE 3: POSTGRESQL (Database) ──────────────────
+  # PostgreSQL is a powerful open-source relational database.
+  # Used by Dropforge (indirectly), Canvass, and almost every
+  # serious production application.
+  postgres:
+    image: postgres:16-alpine
+    container_name: homelab_postgres
+    
+    environment:
+      - POSTGRES_DB=homelab_db
+      - POSTGRES_USER=homelab_user
+      - POSTGRES_PASSWORD=homelab_pass
+      # PGDATA: where postgres stores its data files inside the container
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    
+    # volumes: persist database data even if the container is deleted
+    # postgres_data: a named volume (defined in the 'volumes' section below)
+    # Without this volume, ALL data is lost when the container stops
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Mount initialization SQL scripts — run on first start only
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    
+    healthcheck:
+      # pg_isready: postgres's built-in health check tool
+      # -U: the username to check with
+      test: ["CMD-SHELL", "pg_isready -U homelab_user -d homelab_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    
+    # Only accessible from the backend network — the internet can't reach the DB
+    networks:
+      - backend
+    
+    restart: unless-stopped
+
+  # ── SERVICE 4: REDIS (Cache + Message Queue) ──────────
+  # Redis is an in-memory key-value store. It's blazing fast because
+  # everything lives in RAM (not on disk like a traditional database).
+  # Uses:
+  #   - Caching: store expensive query results for seconds/minutes
+  #   - Session storage: user login sessions
+  #   - Message queues: background job processing
+  #   - Rate limiting: track API request counts
+  redis:
+    image: redis:7-alpine
+    container_name: homelab_redis
+    
+    # command: override the default startup command
+    # --requirepass: require authentication to use Redis
+    # --appendonly yes: enable persistence (write changes to disk)
+    # --maxmemory: limit RAM usage so Redis doesn't consume everything
+    # --maxmemory-policy allkeys-lru: when full, evict least recently used keys
+    command: >
+      redis-server
+      --requirepass redis_password
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    
+    volumes:
+      - redis_data:/data    # Persist Redis data
+    
+    networks:
+      - backend
+    
+    restart: unless-stopped
+
+  # ── SERVICE 5: MONITORING (Prometheus + Grafana) ──────
+  # Prometheus: collects metrics from your services (CPU, requests, errors)
+  # Grafana: beautiful dashboards showing those metrics in real time
+  # These two together are the industry standard for monitoring.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: homelab_prometheus
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    
+    # --web.enable-lifecycle: allows reloading config without restart
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=15d'   # Keep 15 days of metrics
+    
+    ports:
+      - "9090:9090"    # Prometheus web UI
+    
+    networks:
+      - monitoring
+    
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: homelab_grafana
+    
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123    # Change in production!
+      - GF_USERS_ALLOW_SIGN_UP=false
+    
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    
+    depends_on:
+      - prometheus
+    
+    ports:
+      - "3001:3000"    # Grafana dashboard (note: app uses 3000, so we use 3001)
+    
+    networks:
+      - monitoring
+    
+    restart: unless-stopped
+
+# ── NETWORKS ─────────────────────────────────────────────
+# Named networks provide isolation between service groups.
+# frontend: public-facing services (nginx, app)
+# backend: private services (postgres, redis) — not reachable from internet
+# monitoring: isolated monitoring services
+networks:
+  frontend:
+    driver: bridge   # bridge = default Docker network mode, like a virtual switch
+  backend:
+    driver: bridge
+  monitoring:
+    driver: bridge
+
+# ── VOLUMES ──────────────────────────────────────────────
+# Named volumes persist data outside of containers.
+# When a container is deleted, the volume data survives.
+# Docker manages where these are actually stored on disk.
+volumes:
+  postgres_data:    # PostgreSQL database files
+  redis_data:       # Redis persistence files
+  prometheus_data:  # Prometheus time-series metrics
+  grafana_data:     # Grafana dashboards and configuration
